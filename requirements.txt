@@ -1,0 +1,23 @@
+cat > requirements.txt << 'EOF'
+# Core simulation (ядро симуляции)
+simpy==4.1.2
+
+# Data processing (обработка данных)
+numpy==2.5.0
+pandas==3.0.3
+PyYAML==6.0.2
+
+# Visualization (визуализация)
+plotly==6.8.0
+matplotlib==3.10.0
+streamlit==1.58.0
+
+# Optimization (оптимизация, решение задач логистики)
+ortools==9.15.6755
+
+# Testing (тестирование)
+pytest==9.1.1
+
+# Development tools (инструменты разработки)
+jupyterlab==4.4.0
+EOF
