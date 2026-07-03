@@ -521,3 +521,464 @@ with tab_overview:
             cfg = (summary or {}).get("config", {})
             if cfg:
                 st.json(cfg, expanded=False)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ----------------------------------------------------------------------------
+# Вкладка "Пропускная способность"
+# ----------------------------------------------------------------------------
+with tab_throughput:
+    st.header("Пропускная способность системы")
+
+    if ops_min is None or ops_min.empty:
+        st.warning("[!] Нет данных по операциям (operations_minutely.csv)")
+    else:
+        df = ops_min.copy()
+
+        # Определяем колонку времени
+        time_col = None
+        for c in ["timestamp", "time", "t", "minute", "ts"]:
+            if c in df.columns:
+                time_col = c
+                break
+
+        if time_col is None:
+            st.error("[X] В operations_minutely.csv не найдена колонка времени")
+        else:
+            # Приводим к datetime, если возможно
+            try:
+                df[time_col] = pd.to_datetime(df[time_col])
+                use_datetime = True
+            except Exception:
+                use_datetime = False
+
+            # Определяем колонку с количеством товаров/операций
+            value_candidates = [
+                "items", "items_count", "count", "throughput",
+                "n_items", "processed", "value"
+            ]
+            value_col = None
+            for c in value_candidates:
+                if c in df.columns:
+                    value_col = c
+                    break
+
+            if value_col is None:
+                # Берём первую числовую колонку (не time_col)
+                numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+                numeric_cols = [c for c in numeric_cols if c != time_col]
+                if numeric_cols:
+                    value_col = numeric_cols[0]
+
+            # Определяем колонку операции/этапа
+            op_col = None
+            for c in ["operation", "op", "stage", "process", "type"]:
+                if c in df.columns:
+                    op_col = c
+                    break
+
+            # --- KPI ---
+            st.subheader("Ключевые показатели")
+
+            total_ops = df[value_col].sum() if value_col else 0
+            n_minutes = len(df) if not use_datetime else max(
+                1, int((df[time_col].max() - df[time_col].min()).total_seconds() / 60)
+            )
+            avg_per_min = total_ops / max(n_minutes, 1)
+            peak_per_min = df[value_col].max() if value_col else 0
+            avg_per_hour = avg_per_min * 60
+
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Всего операций", fmt_num(int(total_ops)))
+            k2.metric("Средн. в минуту", fmt_num(round(avg_per_min, 1)))
+            k3.metric("Средн. в час", fmt_num(round(avg_per_hour, 0)))
+            k4.metric("Пик за минуту", fmt_num(int(peak_per_min)))
+
+            st.markdown("---")
+
+            # --- Ресэмплинг по выбранному окну ---
+            st.subheader(f"Динамика операций (окно: {window_choice})")
+
+            plot_df = df.copy()
+
+            if use_datetime:
+                plot_df = plot_df.set_index(time_col)
+                freq_map = {"1min": "1min", "1h": "1h", "12h": "12h", "24h": "24h"}
+                freq = freq_map.get(window_choice, "1h")
+
+                if op_col and op_col in plot_df.columns:
+                    resampled = (
+                        plot_df.groupby(op_col)[value_col]
+                        .resample(freq).sum()
+                        .reset_index()
+                    )
+                    fig_line = px.line(
+                        resampled, x=time_col, y=value_col, color=op_col,
+                        color_discrete_sequence=GAME_COLORS,
+                        markers=True,
+                    )
+                else:
+                    resampled = plot_df[value_col].resample(freq).sum().reset_index()
+                    fig_line = px.line(
+                        resampled, x=time_col, y=value_col,
+                        color_discrete_sequence=["#7cc0ff"],
+                        markers=True,
+                    )
+            else:
+                # Без datetime — просто по индексу
+                if op_col and op_col in plot_df.columns:
+                    fig_line = px.line(
+                        plot_df, x=time_col, y=value_col, color=op_col,
+                        color_discrete_sequence=GAME_COLORS,
+                    )
+                else:
+                    fig_line = px.line(
+                        plot_df, x=time_col, y=value_col,
+                        color_discrete_sequence=["#7cc0ff"],
+                    )
+
+            fig_line.update_traces(line=dict(width=3))
+            fig_line.update_layout(
+                height=420,
+                xaxis_title="Время",
+                yaxis_title="Операций",
+                hovermode="x unified",
+                **PLOTLY_LAYOUT,
+            )
+            st.plotly_chart(fig_line, use_container_width=True)
+
+            st.markdown("---")
+
+            # --- Распределение по операциям ---
+            if op_col and op_col in df.columns and value_col:
+                st.subheader("Распределение по типам операций")
+
+                by_op = (
+                    df.groupby(op_col)[value_col].sum()
+                    .sort_values(ascending=True).reset_index()
+                )
+
+                c1, c2 = st.columns([3, 2])
+                with c1:
+                    fig_bar = px.bar(
+                        by_op, x=value_col, y=op_col, orientation="h",
+                        text=value_col,
+                        color=value_col,
+                        color_continuous_scale=[
+                            [0, "#1e5bb0"], [0.5, "#409cff"], [1, "#7cc0ff"]
+                        ],
+                    )
+                    fig_bar.update_traces(
+                        textposition="outside",
+                        marker_line_color="#cfe4ff",
+                        marker_line_width=2,
+                    )
+                    fig_bar.update_layout(
+                        height=420,
+                        xaxis_title="Всего операций",
+                        yaxis_title="Тип операции",
+                        showlegend=False,
+                        coloraxis_showscale=False,
+                        **PLOTLY_LAYOUT,
+                    )
+                    st.plotly_chart(fig_bar, use_container_width=True)
+
+                with c2:
+                    st.markdown("**ТОП операций:**")
+                    top_df = by_op.sort_values(value_col, ascending=False).head(10)
+                    top_df.columns = ["Операция", "Количество"]
+                    top_df["Доля, %"] = (
+                        top_df["Количество"] / top_df["Количество"].sum() * 100
+                    ).round(1)
+                    st.dataframe(
+                        top_df, use_container_width=True, hide_index=True
+                    )
+
+                st.markdown("---")
+
+            # --- Агрегированная сводка ---
+            if ops_agg is not None and not ops_agg.empty:
+                st.subheader("Агрегированная сводка")
+                with st.expander("[i] ПОКАЗАТЬ ТАБЛИЦУ ops_agg"):
+                    st.dataframe(ops_agg, use_container_width=True, hide_index=True)
+
+            # --- Гистограмма нагрузки по минутам ---
+            if value_col:
+                st.subheader("Гистограмма нагрузки")
+
+                fig_hist = px.histogram(
+                    df, x=value_col, nbins=40,
+                    color_discrete_sequence=["#409cff"],
+                )
+                fig_hist.update_traces(
+                    marker_line_color="#cfe4ff",
+                    marker_line_width=2,
+                )
+                fig_hist.update_layout(
+                    height=360,
+                    xaxis_title="Операций за интервал",
+                    yaxis_title="Частота (кол-во интервалов)",
+                    bargap=0.05,
+                    **PLOTLY_LAYOUT,
+                )
+
+                # Средняя и пиковая линии
+                fig_hist.add_vline(
+                    x=avg_per_min, line_dash="dash", line_color="#7cc0ff",
+                    line_width=3,
+                    annotation_text=f"Средн: {avg_per_min:.1f}",
+                    annotation_position="top",
+                    annotation_font_color="#7cc0ff",
+                )
+                fig_hist.add_vline(
+                    x=peak_per_min, line_dash="dot", line_color="#ffffff",
+                    line_width=3,
+                    annotation_text=f"Пик: {int(peak_per_min)}",
+                    annotation_position="top",
+                    annotation_font_color="#ffffff",
+                )
+                st.plotly_chart(fig_hist, use_container_width=True)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
