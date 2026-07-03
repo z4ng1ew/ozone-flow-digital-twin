@@ -76,6 +76,7 @@ transport_out:
 
 palletizing:
   robots: 9                   # [ОЦЕНКА] расчёт: 185 палет/ч ÷ 22.5/ч = 8.2
+  boxes_per_pallet: 20        # [ТЗ] КТЯ на палете (дублирует flow.boxes_per_pallet)
   sec_per_box: 8              # [ОЦЕНКА] укладка одного КТЯ на палету
 
 shipping:
