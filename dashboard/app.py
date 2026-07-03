@@ -982,3 +982,1078 @@ with tab_throughput:
 
 
 
+# ----------------------------------------------------------------------------
+# Вкладка "Ресурсы и узкие места"
+# ----------------------------------------------------------------------------
+with tab_resources:
+    st.header("Ресурсы и узкие места")
+
+    if utilization is None or utilization.empty:
+        st.warning("[!] Нет данных по утилизации (utilization.csv)")
+    else:
+        df_u = utilization.copy()
+
+        # Автодетект колонок
+        resource_col = None
+        for c in ["resource", "station", "process", "stage", "name", "type"]:
+            if c in df_u.columns:
+                resource_col = c
+                break
+
+        util_col = None
+        for c in ["utilization", "util", "busy_ratio", "load", "usage"]:
+            if c in df_u.columns:
+                util_col = c
+                break
+
+        # fallback — первая числовая колонка
+        if util_col is None:
+            numeric_cols = df_u.select_dtypes(include=[np.number]).columns.tolist()
+            if numeric_cols:
+                util_col = numeric_cols[0]
+
+        if resource_col is None or util_col is None:
+            st.error("[X] Не удалось определить колонки ресурса/утилизации")
+            st.dataframe(df_u.head(), use_container_width=True)
+        else:
+            # Если утилизация в долях (0..1) — конвертируем в проценты
+            max_val = df_u[util_col].max()
+            if max_val is not None and max_val <= 1.5:
+                df_u["_util_pct"] = df_u[util_col] * 100
+            else:
+                df_u["_util_pct"] = df_u[util_col]
+
+            # Агрегируем по ресурсу (на случай, если строк несколько)
+            agg_u = (
+                df_u.groupby(resource_col)["_util_pct"]
+                .mean().reset_index()
+                .sort_values("_util_pct", ascending=False)
+            )
+            agg_u.columns = [resource_col, "Утилизация, %"]
+
+            # --- KPI ---
+            st.subheader("Ключевые показатели")
+
+            n_resources = len(agg_u)
+            avg_util = agg_u["Утилизация, %"].mean()
+            max_util = agg_u["Утилизация, %"].max()
+            n_overloaded = int((agg_u["Утилизация, %"] >= 90).sum())
+            n_idle = int((agg_u["Утилизация, %"] < 30).sum())
+
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Ресурсов", fmt_num(n_resources))
+            k2.metric("Средн. утилизация", f"{avg_util:.1f}%")
+            k3.metric("Перегружено (>=90%)", fmt_num(n_overloaded),
+                      delta="узкое место" if n_overloaded > 0 else "OK",
+                      delta_color="inverse" if n_overloaded > 0 else "normal")
+            k4.metric("Простаивает (<30%)", fmt_num(n_idle))
+
+            st.markdown("---")
+
+            # --- Барчарт утилизации ---
+            st.subheader("Утилизация по ресурсам")
+
+            def util_color(pct: float) -> str:
+                # Синие оттенки: чем выше нагрузка, тем ярче/белее
+                if pct >= 90:
+                    return "#ffffff"   # критично — белый
+                elif pct >= 70:
+                    return "#7cc0ff"   # высоко
+                elif pct >= 40:
+                    return "#409cff"   # средне
+                else:
+                    return "#1e5bb0"   # низко
+
+            agg_u_sorted = agg_u.sort_values("Утилизация, %", ascending=True)
+            colors = [util_color(v) for v in agg_u_sorted["Утилизация, %"]]
+
+            fig_util = px.bar(
+                agg_u_sorted,
+                x="Утилизация, %",
+                y=resource_col,
+                orientation="h",
+                text=agg_u_sorted["Утилизация, %"].round(1).astype(str) + "%",
+            )
+            fig_util.update_traces(
+                marker_color=colors,
+                marker_line_color="#cfe4ff",
+                marker_line_width=2,
+                textposition="outside",
+                textfont=dict(color="#cfe4ff", family="VT323, monospace", size=14),
+            )
+            fig_util.update_layout(
+                height=max(360, 28 * len(agg_u_sorted) + 100),
+                xaxis_title="Утилизация, %",
+                yaxis_title="Ресурс",
+                showlegend=False,
+                **PLOTLY_LAYOUT,
+            )
+            # Пороговые линии
+            fig_util.add_vline(
+                x=70, line_dash="dot", line_color="#7cc0ff", line_width=2,
+                annotation_text="70%", annotation_position="top",
+                annotation_font_color="#7cc0ff",
+            )
+            fig_util.add_vline(
+                x=90, line_dash="dash", line_color="#ffffff", line_width=2,
+                annotation_text="90% КРИТ", annotation_position="top",
+                annotation_font_color="#ffffff",
+            )
+            fig_util.update_xaxes(range=[0, max(100, max_util * 1.1)])
+            st.plotly_chart(fig_util, use_container_width=True)
+
+            st.markdown("---")
+
+            # --- Тепловая карта / категории нагрузки ---
+            c1, c2 = st.columns([3, 2])
+
+            with c1:
+                st.subheader("Категории нагрузки")
+
+                def categorize(pct):
+                    if pct >= 90: return "КРИТИЧНО (>=90%)"
+                    if pct >= 70: return "ВЫСОКО (70-90%)"
+                    if pct >= 40: return "СРЕДНЕ (40-70%)"
+                    return "НИЗКО (<40%)"
+
+                agg_u["Категория"] = agg_u["Утилизация, %"].apply(categorize)
+                cat_counts = (
+                    agg_u["Категория"].value_counts()
+                    .reindex([
+                        "КРИТИЧНО (>=90%)", "ВЫСОКО (70-90%)",
+                        "СРЕДНЕ (40-70%)", "НИЗКО (<40%)"
+                    ], fill_value=0)
+                    .reset_index()
+                )
+                cat_counts.columns = ["Категория", "Ресурсов"]
+
+                fig_cat = px.bar(
+                    cat_counts, x="Категория", y="Ресурсов",
+                    text="Ресурсов",
+                    color="Категория",
+                    color_discrete_map={
+                        "КРИТИЧНО (>=90%)": "#ffffff",
+                        "ВЫСОКО (70-90%)": "#7cc0ff",
+                        "СРЕДНЕ (40-70%)": "#409cff",
+                        "НИЗКО (<40%)": "#1e5bb0",
+                    },
+                )
+                fig_cat.update_traces(
+                    textposition="outside",
+                    marker_line_color="#cfe4ff",
+                    marker_line_width=2,
+                )
+                fig_cat.update_layout(
+                    height=380,
+                    showlegend=False,
+                    xaxis_title="",
+                    yaxis_title="Кол-во ресурсов",
+                    **PLOTLY_LAYOUT,
+                )
+                st.plotly_chart(fig_cat, use_container_width=True)
+
+            with c2:
+                st.subheader("ТОП узких мест")
+
+                bottlenecks = agg_u.sort_values(
+                    "Утилизация, %", ascending=False
+                ).head(10).copy()
+                bottlenecks["Утилизация, %"] = bottlenecks["Утилизация, %"].round(1)
+                bottlenecks = bottlenecks[[resource_col, "Утилизация, %", "Категория"]]
+                st.dataframe(bottlenecks, use_container_width=True, hide_index=True)
+
+                if n_overloaded > 0:
+                    top_bn = bottlenecks.iloc[0]
+                    st.error(
+                        f"[!] УЗКОЕ МЕСТО: {top_bn[resource_col]} — "
+                        f"{top_bn['Утилизация, %']}%"
+                    )
+                else:
+                    st.success("[OK] Критичных узких мест не обнаружено")
+
+            st.markdown("---")
+
+            # --- Полная таблица ---
+            with st.expander("[i] ПОЛНАЯ ТАБЛИЦА УТИЛИЗАЦИИ"):
+                display_df = agg_u.copy()
+                display_df["Утилизация, %"] = display_df["Утилизация, %"].round(2)
+                st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ----------------------------------------------------------------------------
+# Вкладка "Очереди"
+# ----------------------------------------------------------------------------
+with tab_queues:
+    st.header("Очереди в системе")
+
+    if queues is None or queues.empty:
+        st.warning("[!] Нет данных по очередям (queues.csv)")
+    else:
+        df_q = queues.copy()
+
+        # Автодетект колонок
+        time_col = None
+        for c in ["timestamp", "time", "t", "minute", "ts"]:
+            if c in df_q.columns:
+                time_col = c
+                break
+
+        queue_col = None
+        for c in ["queue", "station", "resource", "name", "stage", "process"]:
+            if c in df_q.columns:
+                queue_col = c
+                break
+
+        length_col = None
+        for c in ["length", "queue_length", "size", "count", "items", "n"]:
+            if c in df_q.columns:
+                length_col = c
+                break
+
+        # fallback — первая числовая, не time
+        if length_col is None:
+            numeric_cols = df_q.select_dtypes(include=[np.number]).columns.tolist()
+            numeric_cols = [c for c in numeric_cols if c != time_col]
+            if numeric_cols:
+                length_col = numeric_cols[0]
+
+        if length_col is None:
+            st.error("[X] Не удалось определить колонку длины очереди")
+            st.dataframe(df_q.head(), use_container_width=True)
+        else:
+            # Приводим время
+            use_datetime = False
+            if time_col:
+                try:
+                    df_q[time_col] = pd.to_datetime(df_q[time_col])
+                    use_datetime = True
+                except Exception:
+                    use_datetime = False
+
+            # --- KPI ---
+            st.subheader("Ключевые показатели")
+
+            avg_len = df_q[length_col].mean()
+            max_len = df_q[length_col].max()
+            final_len = 0
+            if time_col and queue_col:
+                last_time = df_q[time_col].max()
+                final_len = df_q[df_q[time_col] == last_time][length_col].sum()
+            elif queue_col:
+                final_len = df_q.groupby(queue_col)[length_col].last().sum()
+            else:
+                final_len = df_q[length_col].iloc[-1]
+
+            n_queues = df_q[queue_col].nunique() if queue_col else 1
+
+            # Проверка на growing queues
+            growing_queues = []
+            if queue_col and time_col:
+                for q_name, grp in df_q.groupby(queue_col):
+                    grp_sorted = grp.sort_values(time_col)
+                    if is_monotonic_growing(grp_sorted[length_col]):
+                        growing_queues.append(q_name)
+
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Очередей", fmt_num(n_queues))
+            k2.metric("Средн. длина", fmt_num(round(avg_len, 1)))
+            k3.metric("Максимум", fmt_num(int(max_len)))
+            k4.metric(
+                "Растущих очередей", fmt_num(len(growing_queues)),
+                delta="накопление" if growing_queues else "стабильно",
+                delta_color="inverse" if growing_queues else "normal",
+            )
+
+            if growing_queues:
+                st.error(
+                    "[!] ОБНАРУЖЕН РОСТ ОЧЕРЕДЕЙ: " +
+                    ", ".join(str(q) for q in growing_queues[:5]) +
+                    (f" и ещё {len(growing_queues) - 5}"
+                     if len(growing_queues) > 5 else "")
+                )
+            else:
+                st.success("[OK] Система стабильна — очереди не растут монотонно")
+
+            st.markdown("---")
+
+            # --- Динамика очередей во времени ---
+            st.subheader("Динамика длины очередей")
+
+            if time_col:
+                plot_df = df_q.copy()
+
+                # Ресэмплинг по окну
+                if use_datetime and queue_col:
+                    freq_map = {"1min": "1min", "1h": "1h", "12h": "12h", "24h": "24h"}
+                    freq = freq_map.get(window_choice, "1h")
+                    plot_df = (
+                        plot_df.set_index(time_col)
+                        .groupby(queue_col)[length_col]
+                        .resample(freq).mean()
+                        .reset_index()
+                    )
+
+                if queue_col:
+                    fig_dyn = px.line(
+                        plot_df, x=time_col, y=length_col, color=queue_col,
+                        color_discrete_sequence=GAME_COLORS,
+                        markers=False,
+                    )
+                else:
+                    fig_dyn = px.line(
+                        plot_df, x=time_col, y=length_col,
+                        color_discrete_sequence=["#7cc0ff"],
+                    )
+
+                fig_dyn.update_traces(line=dict(width=2.5))
+                fig_dyn.update_layout(
+                    height=450,
+                    xaxis_title="Время",
+                    yaxis_title="Длина очереди",
+                    hovermode="x unified",
+                    legend=dict(
+                        bgcolor="rgba(15, 36, 71, 0.8)",
+                        bordercolor="#409cff",
+                        borderwidth=2,
+                    ),
+                    **PLOTLY_LAYOUT,
+                )
+                st.plotly_chart(fig_dyn, use_container_width=True)
+
+                st.markdown("---")
+
+            # --- Сравнение очередей: средняя/пик ---
+            if queue_col:
+                st.subheader("Сравнение очередей")
+
+                stats_df = (
+                    df_q.groupby(queue_col)[length_col]
+                    .agg(["mean", "max", "std"])
+                    .round(2)
+                    .reset_index()
+                )
+                stats_df.columns = [queue_col, "Средняя", "Пик", "СКО"]
+                stats_df = stats_df.sort_values("Пик", ascending=False)
+
+                c1, c2 = st.columns([3, 2])
+
+                with c1:
+                    top_stats = stats_df.head(15).sort_values("Пик", ascending=True)
+
+                    fig_cmp = px.bar(
+                        top_stats,
+                        x=["Средняя", "Пик"],
+                        y=queue_col,
+                        orientation="h",
+                        barmode="group",
+                        color_discrete_sequence=["#409cff", "#7cc0ff"],
+                    )
+                    # px.bar с несколькими x требует melt — сделаем через melt
+                    melted = top_stats.melt(
+                        id_vars=queue_col,
+                        value_vars=["Средняя", "Пик"],
+                        var_name="Метрика",
+                        value_name="Значение",
+                    )
+                    fig_cmp = px.bar(
+                        melted, x="Значение", y=queue_col,
+                        color="Метрика", orientation="h", barmode="group",
+                        color_discrete_map={
+                            "Средняя": "#409cff",
+                            "Пик": "#7cc0ff",
+                        },
+                    )
+                    fig_cmp.update_traces(
+                        marker_line_color="#cfe4ff",
+                        marker_line_width=1.5,
+                    )
+                    fig_cmp.update_layout(
+                        height=max(400, 30 * len(top_stats) + 100),
+                        xaxis_title="Длина очереди",
+                        yaxis_title="Очередь",
+                        legend=dict(
+                            bgcolor="rgba(15, 36, 71, 0.8)",
+                            bordercolor="#409cff",
+                            borderwidth=2,
+                        ),
+                        **PLOTLY_LAYOUT,
+                    )
+                    st.plotly_chart(fig_cmp, use_container_width=True)
+
+                with c2:
+                    st.markdown("**ТОП критичных очередей:**")
+                    display_stats = stats_df.head(10).copy()
+                    if growing_queues:
+                        display_stats["Статус"] = display_stats[queue_col].apply(
+                            lambda x: "РАСТЁТ" if x in growing_queues else "OK"
+                        )
+                    st.dataframe(
+                        display_stats, use_container_width=True, hide_index=True
+                    )
+
+                st.markdown("---")
+
+            # --- Тепловая карта (если много очередей + время) ---
+            if queue_col and time_col and use_datetime:
+                st.subheader("Тепловая карта загрузки очередей")
+
+                heat_df = df_q.copy()
+                freq_map = {"1min": "1min", "1h": "1h", "12h": "12h", "24h": "24h"}
+                freq = freq_map.get(window_choice, "1h")
+
+                heat_pivot = (
+                    heat_df.set_index(time_col)
+                    .groupby(queue_col)[length_col]
+                    .resample(freq).mean()
+                    .reset_index()
+                    .pivot(index=queue_col, columns=time_col, values=length_col)
+                    .fillna(0)
+                )
+
+                if not heat_pivot.empty and heat_pivot.shape[1] > 1:
+                    fig_heat = px.imshow(
+                        heat_pivot,
+                        color_continuous_scale=[
+                            [0.0, "#0a1428"],
+                            [0.3, "#1e5bb0"],
+                            [0.6, "#409cff"],
+                            [0.85, "#7cc0ff"],
+                            [1.0, "#ffffff"],
+                        ],
+                        aspect="auto",
+                    )
+                    fig_heat.update_layout(
+                        height=max(300, 25 * len(heat_pivot) + 100),
+                        xaxis_title="Время",
+                        yaxis_title="Очередь",
+                        coloraxis_colorbar=dict(
+                            title="Длина",
+                            tickfont=dict(color="#cfe4ff"),
+                            titlefont=dict(color="#7cc0ff"),
+                        ),
+                        **PLOTLY_LAYOUT,
+                    )
+                    st.plotly_chart(fig_heat, use_container_width=True)
+
+                st.markdown("---")
+
+            # --- Гистограмма распределения длин ---
+            st.subheader("Распределение длин очередей")
+
+            fig_hist_q = px.histogram(
+                df_q, x=length_col, nbins=40,
+                color=queue_col if queue_col else None,
+                color_discrete_sequence=GAME_COLORS,
+                barmode="overlay" if queue_col else "relative",
+                opacity=0.75,
+            )
+            fig_hist_q.update_traces(
+                marker_line_color="#cfe4ff",
+                marker_line_width=1.5,
+            )
+            fig_hist_q.update_layout(
+                height=380,
+                xaxis_title="Длина очереди",
+                yaxis_title="Частота",
+                bargap=0.05,
+                legend=dict(
+                    bgcolor="rgba(15, 36, 71, 0.8)",
+                    bordercolor="#409cff",
+                    borderwidth=2,
+                ),
+                **PLOTLY_LAYOUT,
+            )
+            fig_hist_q.add_vline(
+                x=avg_len, line_dash="dash", line_color="#7cc0ff", line_width=3,
+                annotation_text=f"Средн: {avg_len:.1f}",
+                annotation_position="top",
+                annotation_font_color="#7cc0ff",
+            )
+            st.plotly_chart(fig_hist_q, use_container_width=True)
+
+            with st.expander("[i] ПОЛНАЯ ТАБЛИЦА ОЧЕРЕДЕЙ"):
+                st.dataframe(df_q.head(500), use_container_width=True, hide_index=True)
+                st.caption(f">> Показаны первые 500 строк из {len(df_q)}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                # ----------------------------------------------------------------------------
+# Вкладка "Аналитические выводы"
+# ----------------------------------------------------------------------------
+with tab_insights:
+    st.header("Аналитические выводы")
+
+    st.markdown(
+        ">> Автоматический анализ прогона: узкие места, стабильность, "
+        "рекомендации."
+    )
+
+    insights = []      # список (уровень, заголовок, описание)
+    LEVEL_OK = "ok"
+    LEVEL_WARN = "warn"
+    LEVEL_CRIT = "crit"
+    LEVEL_INFO = "info"
+
+    # ========================================================================
+    # 1. Анализ баланса потока
+    # ========================================================================
+    totals = (summary or {}).get("totals", {}) or {}
+    balance = (summary or {}).get("balance", {}) or {}
+    horizon = (summary or {}).get("horizon_sec", None)
+
+    items_in = balance.get("items_in", totals.get("infeed_items", 0)) or 0
+    items_shipped = balance.get("items_shipped",
+                                totals.get("shipped_items", 0)) or 0
+    items_sorted = balance.get("items_sorted",
+                               totals.get("sorted_items", 0)) or 0
+    items_nonsort = balance.get("items_nonsort",
+                                totals.get("nonsort_items", 0)) or 0
+
+    wip = max(0, items_in - items_shipped)
+    expected = items_sorted + items_nonsort
+    rel_err = abs(items_in - expected) / max(items_in, 1) * 100
+
+    if items_in > 0:
+        if rel_err < 1:
+            insights.append((
+                LEVEL_OK, "Баланс потока сходится",
+                f"Погрешность {rel_err:.2f}% (< 1%). Модель корректна: "
+                f"items_in ({fmt_num(items_in)}) ≈ sorted + nonsort "
+                f"({fmt_num(expected)})."
+            ))
+        elif rel_err < 5:
+            insights.append((
+                LEVEL_WARN, "Небольшой дисбаланс потока",
+                f"Погрешность {rel_err:.2f}%. Возможны потери на этапах "
+                "или незакрытые операции. Рекомендуется проверить события."
+            ))
+        else:
+            insights.append((
+                LEVEL_CRIT, "Значительный дисбаланс потока",
+                f"Погрешность {rel_err:.2f}%. Разница между входом и суммой "
+                f"выходов: {items_in - expected:+d}. Проверить логику модели."
+            ))
+
+    # ========================================================================
+    # 2. WIP и пропускная способность
+    # ========================================================================
+    if items_in > 0 and items_shipped > 0:
+        ship_ratio = items_shipped / items_in * 100
+        wip_ratio = wip / items_in * 100
+
+        if ship_ratio >= 95:
+            insights.append((
+                LEVEL_OK, "Система успевает отгружать",
+                f"Отгружено {ship_ratio:.1f}% товаров, WIP всего {wip_ratio:.1f}%. "
+                "Пропускная способность соответствует нагрузке."
+            ))
+        elif ship_ratio >= 75:
+            insights.append((
+                LEVEL_WARN, "Умеренное накопление WIP",
+                f"Отгружено {ship_ratio:.1f}%, в системе застряло "
+                f"{fmt_num(wip)} товаров ({wip_ratio:.1f}%). "
+                "Рекомендуется расширить bottleneck-ресурсы."
+            ))
+        else:
+            insights.append((
+                LEVEL_CRIT, "Система не справляется с потоком",
+                f"Отгружено всего {ship_ratio:.1f}%. WIP = {fmt_num(wip)} "
+                f"({wip_ratio:.1f}% от принятого). "
+                "Требуется увеличить мощности узких мест."
+            ))
+
+    if horizon and items_shipped:
+        throughput_per_hour = items_shipped / (horizon / 3600)
+        insights.append((
+            LEVEL_INFO, "Средняя производительность",
+            f"Система отгружает ~{fmt_num(round(throughput_per_hour, 0))} "
+            f"товаров/час за горизонт {format_seconds(horizon)}."
+        ))
+
+    # ========================================================================
+    # 3. Non-sort доля
+    # ========================================================================
+    if items_sorted + items_nonsort > 0:
+        nonsort_ratio = items_nonsort / (items_sorted + items_nonsort) * 100
+
+        if nonsort_ratio < 5:
+            insights.append((
+                LEVEL_OK, "Низкая доля non-sort",
+                f"Non-sort всего {nonsort_ratio:.1f}%. "
+                "Автоматическая сортировка работает эффективно."
+            ))
+        elif nonsort_ratio < 15:
+            insights.append((
+                LEVEL_INFO, "Умеренная доля non-sort",
+                f"Non-sort составляет {nonsort_ratio:.1f}%. "
+                "В пределах нормы, но есть потенциал оптимизации."
+            ))
+        else:
+            insights.append((
+                LEVEL_WARN, "Высокая доля ручной сортировки",
+                f"Non-sort = {nonsort_ratio:.1f}% ({fmt_num(items_nonsort)} шт.). "
+                "Возможные причины: некорректные габариты, сбои сортировщика."
+            ))
+
+    # ========================================================================
+    # 4. Анализ утилизации ресурсов
+    # ========================================================================
+    if utilization is not None and not utilization.empty:
+        df_u = utilization.copy()
+
+        resource_col = None
+        for c in ["resource", "station", "process", "stage", "name", "type"]:
+            if c in df_u.columns:
+                resource_col = c
+                break
+
+        util_col = None
+        for c in ["utilization", "util", "busy_ratio", "load", "usage"]:
+            if c in df_u.columns:
+                util_col = c
+                break
+        if util_col is None:
+            numeric_cols = df_u.select_dtypes(include=[np.number]).columns.tolist()
+            if numeric_cols:
+                util_col = numeric_cols[0]
+
+        if resource_col and util_col:
+            max_val = df_u[util_col].max()
+            if max_val is not None and max_val <= 1.5:
+                df_u["_util_pct"] = df_u[util_col] * 100
+            else:
+                df_u["_util_pct"] = df_u[util_col]
+
+            agg_u = (
+                df_u.groupby(resource_col)["_util_pct"]
+                .mean().reset_index()
+                .sort_values("_util_pct", ascending=False)
+            )
+
+            overloaded = agg_u[agg_u["_util_pct"] >= 90]
+            high = agg_u[(agg_u["_util_pct"] >= 70) & (agg_u["_util_pct"] < 90)]
+            idle = agg_u[agg_u["_util_pct"] < 30]
+
+            if len(overloaded) > 0:
+                top_bn = overloaded.iloc[0]
+                bn_list = ", ".join(
+                    f"{r[resource_col]} ({r['_util_pct']:.0f}%)"
+                    for _, r in overloaded.head(3).iterrows()
+                )
+                insights.append((
+                    LEVEL_CRIT, f"Критическая нагрузка: {len(overloaded)} ресурс(ов)",
+                    f"Узкие места (>=90%): {bn_list}. "
+                    f"Главное: **{top_bn[resource_col]}** — "
+                    f"{top_bn['_util_pct']:.1f}%. Рекомендуется добавить мощности."
+                ))
+            elif len(high) > 0:
+                insights.append((
+                    LEVEL_WARN, f"Высокая нагрузка: {len(high)} ресурс(ов)",
+                    f"Ресурсы в зоне 70-90%: работают на пределе, "
+                    "нет запаса под пиковую нагрузку."
+                ))
+            else:
+                insights.append((
+                    LEVEL_OK, "Нет перегруженных ресурсов",
+                    "Все ресурсы работают в пределах 90%. Запас мощности есть."
+                ))
+
+            if len(idle) > 0:
+                idle_list = ", ".join(str(r) for r in idle[resource_col].head(3))
+                insights.append((
+                    LEVEL_INFO, f"Простаивающие ресурсы: {len(idle)}",
+                    f"Ресурсы с загрузкой < 30%: {idle_list}"
+                    f"{' и др.' if len(idle) > 3 else ''}. "
+                    "Возможно, избыточная мощность или неверная маршрутизация."
+                ))
+
+    # ========================================================================
+    # 5. Анализ очередей
+    # ========================================================================
+    if queues is not None and not queues.empty:
+        df_q = queues.copy()
+
+        time_col_q = None
+        for c in ["timestamp", "time", "t", "minute", "ts"]:
+            if c in df_q.columns:
+                time_col_q = c
+                break
+
+        queue_col_q = None
+        for c in ["queue", "station", "resource", "name", "stage", "process"]:
+            if c in df_q.columns:
+                queue_col_q = c
+                break
+
+        length_col_q = None
+        for c in ["length", "queue_length", "size", "count", "items", "n"]:
+            if c in df_q.columns:
+                length_col_q = c
+                break
+        if length_col_q is None:
+            numeric_cols = df_q.select_dtypes(include=[np.number]).columns.tolist()
+            numeric_cols = [c for c in numeric_cols if c != time_col_q]
+            if numeric_cols:
+                length_col_q = numeric_cols[0]
+
+        if length_col_q and queue_col_q and time_col_q:
+            try:
+                df_q[time_col_q] = pd.to_datetime(df_q[time_col_q])
+            except Exception:
+                pass
+
+            growing = []
+            for q_name, grp in df_q.groupby(queue_col_q):
+                grp_sorted = grp.sort_values(time_col_q)
+                if is_monotonic_growing(grp_sorted[length_col_q]):
+                    growing.append(q_name)
+
+            if growing:
+                growing_str = ", ".join(str(q) for q in growing[:5])
+                if len(growing) > 5:
+                    growing_str += f" и ещё {len(growing) - 5}"
+                insights.append((
+                    LEVEL_CRIT, f"Растущие очереди: {len(growing)}",
+                    f"Очереди с монотонным ростом: {growing_str}. "
+                    "Это признак системной нестабильности — приход превышает "
+                    "обработку. Рост будет продолжаться."
+                ))
+            else:
+                insights.append((
+                    LEVEL_OK, "Очереди стабильны",
+                    "Не обнаружено очередей с монотонным ростом. "
+                    "Система находится в устойчивом режиме."
+                ))
+
+            # Экстремальные пики
+            max_q_len = df_q[length_col_q].max()
+            avg_q_len = df_q[length_col_q].mean()
+            if avg_q_len > 0 and max_q_len / avg_q_len > 5:
+                worst_q = (
+                    df_q.groupby(queue_col_q)[length_col_q].max()
+                    .idxmax()
+                )
+                insights.append((
+                    LEVEL_WARN, "Резкие пики в очередях",
+                    f"Пик ({int(max_q_len)}) в {max_q_len / avg_q_len:.1f}x выше "
+                    f"средней ({avg_q_len:.1f}). Худшая очередь: "
+                    f"**{worst_q}**. Проверить всплески потока."
+                ))
+
+    # ========================================================================
+    # Рендер insights в игровом стиле
+    # ========================================================================
+
+    if not insights:
+        st.info("[i] Нет данных для аналитических выводов")
+    else:
+        # Сводка по количеству
+        n_crit = sum(1 for lvl, _, _ in insights if lvl == LEVEL_CRIT)
+        n_warn = sum(1 for lvl, _, _ in insights if lvl == LEVEL_WARN)
+        n_ok = sum(1 for lvl, _, _ in insights if lvl == LEVEL_OK)
+        n_info = sum(1 for lvl, _, _ in insights if lvl == LEVEL_INFO)
+
+        st.subheader("Сводка проверок")
+
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Критично", fmt_num(n_crit),
+                  delta="проблемы" if n_crit > 0 else "OK",
+                  delta_color="inverse" if n_crit > 0 else "normal")
+        s2.metric("Предупреждения", fmt_num(n_warn))
+        s3.metric("Всё OK", fmt_num(n_ok))
+        s4.metric("Инфо", fmt_num(n_info))
+
+        # Общий вердикт
+        if n_crit > 0:
+            st.error(
+                f"[X] СИСТЕМА НЕСТАБИЛЬНА — обнаружено {n_crit} критических "
+                "проблем. Требуется вмешательство."
+            )
+        elif n_warn > 0:
+            st.warning(
+                f"[!] СИСТЕМА РАБОТАЕТ С ЗАМЕЧАНИЯМИ — {n_warn} предупреждений. "
+                "Есть потенциал оптимизации."
+            )
+        else:
+            st.success(
+                "[OK] СИСТЕМА СТАБИЛЬНА — критических проблем не обнаружено."
+            )
+
+        st.markdown("---")
+
+        # Стили карточек insight
+        LEVEL_STYLES = {
+            LEVEL_CRIT: {
+                "border": "#ff5577",
+                "bg": "linear-gradient(180deg, #3a0f1e 0%, #1a0a12 100%)",
+                "accent": "#ff88a0",
+                "label": "КРИТИЧНО",
+                "shadow": "#5a1428",
+            },
+            LEVEL_WARN: {
+                "border": "#ffcc44",
+                "bg": "linear-gradient(180deg, #3a2a0f 0%, #1a140a 100%)",
+                "accent": "#ffe088",
+                "label": "ПРЕДУПРЕЖДЕНИЕ",
+                "shadow": "#5a4014",
+            },
+            LEVEL_OK: {
+                "border": "#44dd88",
+                "bg": "linear-gradient(180deg, #0f3a24 0%, #0a1a14 100%)",
+                "accent": "#88ffbb",
+                "label": "OK",
+                "shadow": "#145a34",
+            },
+            LEVEL_INFO: {
+                "border": "#409cff",
+                "bg": "linear-gradient(180deg, #0f2447 0%, #0a1830 100%)",
+                "accent": "#7cc0ff",
+                "label": "ИНФО",
+                "shadow": "#1a3a6a",
+            },
+        }
+
+        # Сортируем: сначала критичные, потом warn, ok, info
+        order = {LEVEL_CRIT: 0, LEVEL_WARN: 1, LEVEL_OK: 2, LEVEL_INFO: 3}
+        insights_sorted = sorted(insights, key=lambda x: order.get(x[0], 99))
+
+        st.subheader(f"Детальные выводы ({len(insights_sorted)})")
+
+        for level, title, desc in insights_sorted:
+            style = LEVEL_STYLES.get(level, LEVEL_STYLES[LEVEL_INFO])
+
+            card_html = f"""
+            <div style="
+                background: {style['bg']};
+                border: 3px solid {style['border']};
+                padding: 16px 20px;
+                margin-bottom: 16px;
+                box-shadow: 4px 4px 0 {style['shadow']},
+                            inset 0 0 0 1px {style['accent']};
+                position: relative;
+            ">
+                <div style="
+                    font-family: 'Press Start 2P', monospace;
+                    font-size: 0.65rem;
+                    color: {style['accent']};
+                    text-transform: uppercase;
+                    letter-spacing: 2px;
+                    margin-bottom: 8px;
+                    text-shadow: 2px 2px 0 #0a1428;
+                ">
+                    [ {style['label']} ]
+                </div>
+                <div style="
+                    font-family: 'Press Start 2P', monospace;
+                    font-size: 0.85rem;
+                    color: #ffffff;
+                    margin-bottom: 10px;
+                    line-height: 1.5;
+                    text-shadow: 2px 2px 0 #0a1428;
+                ">
+                    {title}
+                </div>
+                <div style="
+                    font-family: 'VT323', monospace;
+                    font-size: 1.15rem;
+                    color: #cfe4ff;
+                    line-height: 1.4;
+                ">
+                    {desc}
+                </div>
+            </div>
+            """
+            st.markdown(card_html, unsafe_allow_html=True)
+
+        st.markdown("---")
+
+        # ====================================================================
+        # Рекомендации
+        # ====================================================================
+        st.subheader("Рекомендации")
+
+        recommendations = []
+
+        if n_crit > 0:
+            for lvl, title, _ in insights_sorted:
+                if lvl != LEVEL_CRIT:
+                    continue
+                if "нагрузка" in title.lower() or "узк" in title.lower():
+                    recommendations.append(
+                        ">> Увеличить число параллельных линий/сотрудников "
+                        "на узких местах или ускорить обработку."
+                    )
+                elif "очеред" in title.lower() or "растущ" in title.lower():
+                    recommendations.append(
+                        ">> Снизить входной поток или расширить мощность "
+                        "обработчиков, читающих из растущих очередей."
+                    )
+                elif "не справ" in title.lower() or "wip" in title.lower():
+                    recommendations.append(
+                        ">> Требуется масштабирование: пропускная способность "
+                        "ниже входного потока."
+                    )
+                elif "баланс" in title.lower():
+                    recommendations.append(
+                        ">> Проверить логику модели: возможна потеря товаров "
+                        "или незакрытые события."
+                    )
+
+        if n_warn > 0 and not recommendations:
+            recommendations.append(
+                ">> Мониторить ресурсы в зоне 70-90% — при росте нагрузки "
+                "они станут узким местом."
+            )
+
+        if not recommendations and n_crit == 0 and n_warn == 0:
+            recommendations.append(
+                ">> Система работает оптимально. Можно рассмотреть увеличение "
+                "входного потока для проверки запаса мощности."
+            )
+
+        # Уникальные
+        recommendations = list(dict.fromkeys(recommendations))
+
+        for rec in recommendations:
+            st.markdown(
+                f"""
+                <div style="
+                    background: linear-gradient(180deg, #0f2447 0%, #0a1830 100%);
+                    border-left: 5px solid #7cc0ff;
+                    padding: 12px 18px;
+                    margin-bottom: 10px;
+                    font-family: 'VT323', monospace;
+                    font-size: 1.15rem;
+                    color: #cfe4ff;
+                    box-shadow: 3px 3px 0 #1a3a6a;
+                ">
+                    {rec}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        # ====================================================================
+        # Итоговая техническая справка
+        # ====================================================================
+        with st.expander("[i] ТЕХНИЧЕСКИЕ ДЕТАЛИ ПРОГОНА"):
+            tech = {
+                "Горизонт симуляции": format_seconds(horizon),
+                "Товаров принято": fmt_num(items_in),
+                "Товаров отгружено": fmt_num(items_shipped),
+                "Отсортированных": fmt_num(items_sorted),
+                "Non-sort": fmt_num(items_nonsort),
+                "WIP на конец": fmt_num(wip),
+                "Погрешность баланса": f"{rel_err:.3f}%",
+                "Режим назначения": (summary or {}).get("assignment_mode", "—"),
+            }
+            tech_df = pd.DataFrame(
+                [(k, v) for k, v in tech.items()],
+                columns=["Параметр", "Значение"],
+            )
+            st.dataframe(tech_df, use_container_width=True, hide_index=True)
