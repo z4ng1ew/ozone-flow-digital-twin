@@ -1,28 +1,23 @@
-
 __pycache__/
 *.py[cod]
-*$py.class
 *.so
 .Python
 .venv/
 env/
 venv/
-
-
 data/out/*
 !data/out/.gitkeep
+data/out_*/
 *.log
-*.csv
-
-
 .vscode/
 .idea/
 *.swp
-*.swo
-
-
 .DS_Store
-Thumbs.db
-
-
 .ipynb_checkpoints/
+node_modules/
+# крупные артефакты в релиз, не в git
+*.mp4
+*.blend1
+viz3d/blender/renders/
+# secrets
+.env
